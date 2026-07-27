@@ -1,0 +1,25 @@
+name: "Activity to Slack"
+version: "0.1.0"
+slug: "activity_to_slack"
+description: "Mirrors Home Assistant Activities to Slack"
+startup: application
+boot: auto
+init: false
+
+arch:
+  - amd64
+  - aarch64
+
+homeassistant_api: true
+
+options:
+  slack_bot_token: null
+  slack_channel_id: null
+  initial_lookback_seconds: 10
+  include_area: true
+
+schema:
+  slack_bot_token: password
+  slack_channel_id: str
+  initial_lookback_seconds: "int(0,86400)"
+  include_area: bool
