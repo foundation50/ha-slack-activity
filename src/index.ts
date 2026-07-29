@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import { readFile, rename, writeFile } from "node:fs/promises"
 import WebSocket, { type RawData } from "ws"
+import { WebClient } from "@slack/web-api"
 
 const OPTIONS_PATH = "/data/options.json"
 const STATE_PATH = "/data/state.json"
@@ -422,12 +423,31 @@ class SlackPoster {
     onSuccess: () => Promise<void>
   }> = []
 
+  private readonly client: WebClient
   private draining = false
 
   public constructor(
-    private readonly token: string,
+    token: string,
     private readonly channel: string,
-  ) {}
+  ) {
+    const normalizedToken = token.trim()
+
+    if (!normalizedToken.startsWith("xoxb-")) {
+      throw new Error("Slack token does not look like a Bot User OAuth Token")
+    }
+
+    this.client = new WebClient(normalizedToken)
+  }
+
+  public async testAuthentication(): Promise<void> {
+    const result = await this.client.auth.test()
+
+    console.log("Slack authentication succeeded", {
+      team: result.team,
+      user: result.user,
+      botId: result.bot_id,
+    })
+  }
 
   public enqueue(message: SlackMessage, onSuccess: () => Promise<void>): void {
     this.queue.push({ message, onSuccess })
@@ -466,8 +486,6 @@ class SlackPoster {
         try {
           await job.onSuccess()
         } catch (error) {
-          // do not post the Slack message twice just because cursor persistence
-          // failed. A restart might display this entry
           console.error("Could not persist Activity cursor", error)
         }
 
@@ -483,50 +501,18 @@ class SlackPoster {
   }
 
   private async post(message: SlackMessage): Promise<void> {
-    for (;;) {
-      const response = await fetch("https://slack.com/api/chat.postMessage", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer: ${this.token}`,
-          "content-type": "application/json; charset=utf-8",
-        },
-        body: JSON.stringify({
-          ...message,
-          channel: this.channel,
-        }),
-      })
+    const result = await this.client.chat.postMessage({
+      channel: this.channel,
+      text: message.text,
+      blocks: message.blocks as any,
+      unfurl_links: message.unfurl_links,
+      unfurl_media: message.unfurl_media,
+    })
 
-      if (response.status === 429) {
-        const retryAfterSeconds = Number(
-          response.headers.get("retry-after") ?? "1",
-        )
-
-        await sleep(Math.max(1, retryAfterSeconds) * 1_000)
-        continue
-      }
-
-      if (!response.ok) {
-        throw new Error(
-          `Slack HTTP error ${response.status}: ${await response.text()}`,
-        )
-      }
-
-      const result = (await response.json()) as {
-        ok?: boolean
-        error?: string
-      }
-
-      if (!result.ok) {
-        if (result.error === "rate_limited" || result.error === "rateLimited") {
-          await sleep(1_000)
-          continue
-        }
-
-        throw new Error(`Slack API error: ${result.error ?? "unknown"}`)
-      }
-
-      return
-    }
+    console.log("Posted Activity entry to Slack", {
+      channel: result.channel,
+      timestamp: result.ts,
+    })
   }
 }
 
@@ -537,7 +523,7 @@ function formatSlackMessage(
 ): SlackMessage {
   const name = metadata.getFriendlyName(entry)
   const state = metadata.getState(entry.entity_id)
-  const areas = options.include_area
+  const area = options.include_area
     ? metadata.getAreaName(entry.entity_id)
     : undefined
 
@@ -568,32 +554,18 @@ function formatSlackMessage(
     .filter((value): value is string => Boolean(value))
     .map((value) => `_${escapeSlack(value)}_`)
 
-  const time = new Intl.DateTimeFormat("en-US", {
-    timeZone: metadata.timeZone,
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true,
-  }).format(new Date(entry.when * 1_000))
-
-  const rightColumn = [markdownHeadline, ...secondaryLines].join("\n")
+  const messageBody = [markdownHeadline, ...secondaryLines].join("\n")
 
   return {
     channel: "",
-    text: `${time} ${plainHeadline}${area ? ` - ${area}` : ""}`,
+    text: `${plainHeadline}${area ? ` — ${area}` : ""}`,
     blocks: [
       {
         type: "section",
-        fields: [
-          {
-            type: "mrkdwn",
-            text: `\`${time}\``,
-          },
-          {
-            type: "mrkdwn",
-            text: rightColumn,
-          },
-        ],
+        text: {
+          type: "mrkdwn",
+          text: messageBody,
+        },
       },
     ],
     unfurl_links: false,
@@ -780,17 +752,38 @@ async function readOptions(): Promise<Options> {
     await readFile(OPTIONS_PATH, "utf8"),
   ) as Partial<Options>
 
-  if (!value.slack_bot_token) {
-    throw new Error("slack_bot_token is required")
+  const slackBotToken =
+    typeof value.slack_bot_token === "string"
+      ? value.slack_bot_token.trim()
+      : ""
+
+  const slackChannelId =
+    typeof value.slack_channel_id === "string"
+      ? value.slack_channel_id.trim()
+      : ""
+
+  console.log("Slack configuration loaded", {
+    tokenPresent: slackBotToken.length > 0,
+    tokenLooksLikeBotToken: slackBotToken.startsWith("xoxb-"),
+    tokenLength: slackBotToken.length,
+    channelId: slackChannelId,
+  })
+
+  if (!slackBotToken) {
+    throw new Error("slack_bot_token is missing or empty")
   }
 
-  if (!value.slack_channel_id) {
-    throw new Error("slack_channel_id is required")
+  if (!slackBotToken.startsWith("xoxb-")) {
+    throw new Error("slack_bot_token does not look like a Bot User OAuth Token")
+  }
+
+  if (!slackChannelId) {
+    throw new Error("slack_channel_id is missing or empty")
   }
 
   return {
-    slack_bot_token: value.slack_bot_token,
-    slack_channel_id: value.slack_channel_id,
+    slack_bot_token: slackBotToken,
+    slack_channel_id: slackChannelId,
     initial_lookback_seconds: value.initial_lookback_seconds ?? 10,
     include_area: value.include_area ?? true,
   }
@@ -835,6 +828,10 @@ async function main(): Promise<void> {
     options.slack_bot_token,
     options.slack_channel_id,
   )
+
+  await slack.testAuthentication()
+
+  console.log("Slack authentication verified; starting Activity bridge")
 
   let reconnectDelay = 1_000
 
@@ -913,7 +910,7 @@ async function main(): Promise<void> {
 
       refreshTimer = setInterval(() => {
         void loadMetadata(client)
-          .then((refrshedMetadata) => {
+          .then((refreshedMetadata) => {
             metadata = refreshedMetadata
             console.log("Refreshed Home Assistant metadata")
           })
