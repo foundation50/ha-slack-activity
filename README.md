@@ -1,6 +1,8 @@
 # Home Assistant Activity to Slack
 
-A Home Assistant add-on that mirrors Activity entries to Slack and listens for a theatre arming command.
+A Home Assistant app repository containing an add-on that mirrors Activity entries to Slack and listens for a theatre arming command.
+
+Install this repository in the Home Assistant app store, then install **Activity to Slack**.
 
 ## Behavior
 
@@ -40,6 +42,7 @@ For a private security channel, use `message.groups` instead of `message.channel
 ## Development
 
 ```sh
+cd slack-activity
 npm ci
 npm run check
 npm run build
