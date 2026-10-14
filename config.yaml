@@ -1,5 +1,5 @@
 name: "Activity to Slack"
-version: "0.1.5"
+version: "0.1.6"
 slug: "activity_to_slack"
 description: "Mirrors Home Assistant Activities to Slack"
 startup: application
