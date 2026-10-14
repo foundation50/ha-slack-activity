@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import { readFile, rename, writeFile } from "node:fs/promises"
 import WebSocket, { type RawData } from "ws"
+import { SocketModeClient } from "@slack/socket-mode"
 import { WebClient } from "@slack/web-api"
 
 const OPTIONS_PATH = "/data/options.json"
@@ -12,10 +13,15 @@ const SLACK_INTERVAL_MS = 1_100
 const METADATA_REFRESH_MS = 5 * 60 * 1_000
 const REPLAY_OVERLAP_SECONDS = 2
 const RECENT_KEY_LIMIT = 5_000
+const SECURITY_MESSAGE_PREFIX = "THEATRE armed"
+const DOOR_RELEASE_MS = 2_000
 
 interface Options {
+  slack_app_token: string
   slack_bot_token: string
   slack_channel_id: string
+  security_channel_id: string
+  door_switch_entity_id: string
   initial_lookback_seconds: number
   include_area: boolean
 }
@@ -516,6 +522,74 @@ class SlackPoster {
   }
 }
 
+class SlackSecurityListener {
+  private readonly client: SocketModeClient
+  private pulse: Promise<void> = Promise.resolve()
+
+  public constructor(
+    appToken: string,
+    private readonly channelId: string,
+    private readonly switchEntityId: string,
+    private readonly getHomeAssistantClient: () => HomeAssistantClient | undefined,
+  ) {
+    this.client = new SocketModeClient({
+      appToken,
+    })
+
+    this.client.on("message", ({ event, ack }) => {
+      void ack()
+
+      if (
+        event.channel !== this.channelId ||
+        !event.text.startsWith(SECURITY_MESSAGE_PREFIX)
+      ) {
+        return
+      }
+
+      console.log("Received theatre arming request from Slack")
+      this.enqueuePulse()
+    })
+  }
+
+  public async start(): Promise<void> {
+    await this.client.start()
+    console.log("Slack Socket Mode connected for security channel")
+  }
+
+  private enqueuePulse(): void {
+    this.pulse = this.pulse
+      .catch(() => undefined)
+      .then(async () => {
+        const homeAssistant = this.getHomeAssistantClient()
+
+        if (!homeAssistant) {
+          throw new Error("Home Assistant is not connected")
+        }
+
+        console.log("Releasing theatre door magnet")
+        await homeAssistant.request("call_service", {
+          domain: "switch",
+          service: "turn_off",
+          service_data: { entity_id: this.switchEntityId },
+        })
+
+        try {
+          await sleep(DOOR_RELEASE_MS)
+        } finally {
+          console.log("Restoring theatre door magnet")
+          await homeAssistant.request("call_service", {
+            domain: "switch",
+            service: "turn_on",
+            service_data: { entity_id: this.switchEntityId },
+          })
+        }
+      })
+      .catch((error) => {
+        console.error("Could not operate theatre door magnet", error)
+      })
+  }
+}
+
 function formatSlackMessage(
   entry: LogbookEntry,
   metadata: MetadataIndex,
@@ -539,14 +613,10 @@ function formatSlackMessage(
       : name
 
   const markdownHeadline = entry.message
-    ? `${iconFor(entry, state)} *${escapeSlack(name)}* ${escapeSlack(
-        entry.message,
-      )}`
+    ? `*${escapeSlack(name)}* ${escapeSlack(entry.message)}`
     : formattedState
-      ? `${iconFor(entry, state)} *${escapeSlack(name)}* -> ${escapeSlack(
-          formattedState,
-        )}`
-      : `${iconFor(entry, state)} *${escapeSlack(name)}`
+      ? `*${escapeSlack(name)}* -> ${escapeSlack(formattedState)}`
+      : `*${escapeSlack(name)}*`
 
   const cause = formatCause(entry)
 
@@ -747,6 +817,18 @@ function escapeSlack(value: string): string {
     .replaceAll(">", "&gt;")
 }
 
+function shouldIgnoreActivityEntry(entry: LogbookEntry): boolean {
+  const entityId = entry.entity_id ?? ""
+  const domain =
+    entry.domain ?? (entityId.includes(".") ? entityId.split(".")[0] : "")
+
+  return (
+    entityId === "sun.sun" ||
+    entityId.startsWith("sensor.sun_next_") ||
+    domain === "weather"
+  )
+}
+
 async function readOptions(): Promise<Options> {
   const value = JSON.parse(
     await readFile(OPTIONS_PATH, "utf8"),
@@ -757,12 +839,29 @@ async function readOptions(): Promise<Options> {
       ? value.slack_bot_token.trim()
       : ""
 
+  const slackAppToken =
+    typeof value.slack_app_token === "string"
+      ? value.slack_app_token.trim()
+      : ""
+
   const slackChannelId =
     typeof value.slack_channel_id === "string"
       ? value.slack_channel_id.trim()
       : ""
 
+  const securityChannelId =
+    typeof value.security_channel_id === "string"
+      ? value.security_channel_id.trim()
+      : ""
+
+  const doorSwitchEntityId =
+    typeof value.door_switch_entity_id === "string"
+      ? value.door_switch_entity_id.trim()
+      : ""
+
   console.log("Slack configuration loaded", {
+    appTokenPresent: slackAppToken.length > 0,
+    appTokenLooksLikeAppToken: slackAppToken.startsWith("xapp-"),
     tokenPresent: slackBotToken.length > 0,
     tokenLooksLikeBotToken: slackBotToken.startsWith("xoxb-"),
     tokenLength: slackBotToken.length,
@@ -777,13 +876,32 @@ async function readOptions(): Promise<Options> {
     throw new Error("slack_bot_token does not look like a Bot User OAuth Token")
   }
 
+  if (!slackAppToken) {
+    throw new Error("slack_app_token is missing or empty")
+  }
+
+  if (!slackAppToken.startsWith("xapp-")) {
+    throw new Error("slack_app_token does not look like an App-Level Token")
+  }
+
   if (!slackChannelId) {
     throw new Error("slack_channel_id is missing or empty")
   }
 
+  if (!securityChannelId) {
+    throw new Error("security_channel_id is missing or empty")
+  }
+
+  if (!doorSwitchEntityId.startsWith("switch.")) {
+    throw new Error("door_switch_entity_id must be a switch entity ID")
+  }
+
   return {
+    slack_app_token: slackAppToken,
     slack_bot_token: slackBotToken,
     slack_channel_id: slackChannelId,
+    security_channel_id: securityChannelId,
+    door_switch_entity_id: doorSwitchEntityId,
     initial_lookback_seconds: value.initial_lookback_seconds ?? 10,
     include_area: value.include_area ?? true,
   }
@@ -833,6 +951,16 @@ async function main(): Promise<void> {
 
   console.log("Slack authentication verified; starting Activity bridge")
 
+  let homeAssistant: HomeAssistantClient | undefined
+  const securityListener = new SlackSecurityListener(
+    options.slack_app_token,
+    options.security_channel_id,
+    options.door_switch_entity_id,
+    () => homeAssistant,
+  )
+
+  await securityListener.start()
+
   let reconnectDelay = 1_000
 
   for (;;) {
@@ -843,6 +971,7 @@ async function main(): Promise<void> {
 
       const client = new HomeAssistantClient(supervisorToken)
       await client.connect()
+      homeAssistant = client
 
       console.log("Connected; loading metadata")
 
@@ -871,6 +1000,11 @@ async function main(): Promise<void> {
           for (const entry of streamEvent.events ?? []) {
             if (!Number.isFinite(entry.when)) {
               console.warn("Ignoring Activity entry without a timestamp", entry)
+              continue
+            }
+
+            if (shouldIgnoreActivityEntry(entry)) {
+              console.log(`Ignoring Activity entry from ${entry.entity_id}`)
               continue
             }
 
@@ -926,6 +1060,8 @@ async function main(): Promise<void> {
     } catch (error) {
       console.error("Activity bridge failed", error)
     } finally {
+      homeAssistant = undefined
+
       if (refreshTimer) {
         clearInterval(refreshTimer)
       }
